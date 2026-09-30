@@ -1,0 +1,20 @@
+{
+  "_comment": "Optional. Copy to ~/.config/agent-fleet/config.json. Every key can be left out.",
+
+  "accounts": [
+    { "configDir": "~/.claude", "name": "Claude 1" },
+    { "configDir": "~/.claude-2", "name": "Claude 2" },
+    { "configDir": "~/.claude-work", "name": "Work", "forbidden": true, "note": "work account, never for personal agents" }
+  ],
+
+  "codexHome": "~/.codex",
+
+  "prices": {
+    "claude-opus": [5, 25, 0.5, 6.25],
+    "claude-sonnet": [3, 15, 0.3, 3.75]
+  },
+  "pricesAssumed": ["claude-fable"],
+
+  "policyFile": "~/.config/agent-fleet/models.conf",
+  "loopAgents": ["support-bot"]
+}

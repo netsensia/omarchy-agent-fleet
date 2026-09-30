@@ -1,0 +1,7 @@
+[Unit]
+Description=Agent Fleet: refresh plan limits for extra Claude accounts
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agent-fleet limits
+Nice=10

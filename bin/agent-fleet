@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+"""agent-fleet: where an AI coding-agent fleet's usage goes, per agent.
+
+For every herdr agent: which Claude/Codex account it runs on, its model and effort, how full its
+context window is, and its estimated usage today and over the last 7 days, plus suggestions for
+where to save.
+
+    agent-fleet              table of every agent, heaviest first, plus suggestions
+    agent-fleet collect      write the snapshot the Omarchy bar widget reads (timer: every minute)
+    agent-fleet limits       refresh plan limits for extra Claude accounts (timer: every 5 minutes)
+    agent-fleet --json       print the snapshot
+    agent-fleet demo         show made-up sample data in the widget (to try it out, or for screenshots)
+    agent-fleet demo --off   go back to your real fleet
+    agent-fleet demo --print print the sample data as the terminal table
+
+Claude cost is an API-list-price ESTIMATE used only to compare agents: on a flat subscription, an
+agent's share of estimated cost approximates its share of the allowance. Codex is shown in tokens.
+
+Configuration is optional: ~/.config/agent-fleet/config.json (see config.example.json).
+"""
+import datetime as dt
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+HOME = pathlib.Path.home()
+XDG_STATE = pathlib.Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state"))
+XDG_CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache"))
+XDG_CONFIG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+STATE_DIR = XDG_STATE / "agent-fleet"
+CACHE_DIR = XDG_CACHE / "agent-fleet"
+CONFIG_FILE = XDG_CONFIG / "agent-fleet/config.json"
+DEMO_FLAG = STATE_DIR / "demo-mode"
+OMARCHY_USAGE = XDG_STATE / "omarchy/agents/usage"
+OMARCHY_CLAUDE_COLLECTOR = pathlib.Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")) / "bin/omarchy-agent-usage-claude"
+DEFAULT_CLAUDE_DIR = HOME / ".claude"
+PARSER_VERSION = 4
+
+# USD per million tokens: input, output, cache read, cache write. Opus matches Claude Code's own
+# built-in default table; Sonnet and Haiku are published list prices; Fable is assumed.
+DEFAULT_PRICES = {
+    "claude-opus": [5, 25, 0.5, 6.25],
+    "claude-sonnet": [3, 15, 0.3, 3.75],
+    "claude-haiku": [1, 5, 0.1, 1.25],
+    "claude-fable": [10, 50, 1, 12.5],
+}
+DEFAULT_ASSUMED = ["claude-fable"]
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m|\\u001b\[[0-9;]*m")
+
+
+# ------------------------------------------------------------------ helpers
+
+
+def local_date(ts):
+    try:
+        return dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def iso_to_epoch(ts):
+    try:
+        return dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0
+
+
+def load_json(path, default):
+    try:
+        return json.loads(pathlib.Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def write_json_atomic(path, data):
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name("." + path.name + ".tmp")
+    tmp.write_text(json.dumps(data, separators=(",", ":")))
+    os.replace(tmp, path)
+
+
+def expand(p):
+    return pathlib.Path(os.path.expanduser(str(p))).absolute()
+
+
+def fmt_tokens(n):
+    n = float(n or 0)
+    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if n >= div:
+            return ("%.1f" % (n / div)).rstrip("0").rstrip(".") + unit
+    return str(int(n))
+
+
+def model_label(model):
+    m = str(model or "")
+    if not m or m == "<synthetic>":
+        return ""
+    if m.startswith("claude-"):
+        parts = m[7:].split("-")
+        ver = ".".join(p for p in parts[1:] if p.isdigit() and len(p) < 3)
+        return (parts[0].capitalize() + " " + ver).strip()
+    return m
+
+
+def median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    return xs[len(xs) // 2] if xs else 0
+
+
+# ------------------------------------------------------------------ configuration
+
+
+def config():
+    return load_json(CONFIG_FILE, {})
+
+
+def prices(cfg):
+    table = dict(DEFAULT_PRICES)
+    table.update(cfg.get("prices") or {})
+    return table
+
+
+def price_for(model, table):
+    m = str(model or "")
+    for key in sorted(table, key=len, reverse=True):
+        if m.startswith(key):
+            return table[key]
+    return None
+
+
+def claude_accounts(cfg):
+    """Configured accounts, or every ~/.claude and ~/.claude-* directory that looks like a Claude config."""
+    out = []
+    if cfg.get("accounts"):
+        for a in cfg["accounts"]:
+            d = expand(a["configDir"])
+            aid = a.get("id") or d.name.lstrip(".")
+            out.append({"id": aid, "dir": d, "name": a.get("name") or default_name(aid),
+                        "forbidden": bool(a.get("forbidden")), "note": a.get("note", "")})
+        return out
+    dirs = [DEFAULT_CLAUDE_DIR] + sorted(HOME.glob(".claude-*"))
+    for d in dirs:
+        if d.is_dir() and any((d / f).exists() for f in ("settings.json", ".credentials.json", "projects")):
+            aid = d.name.lstrip(".")
+            out.append({"id": aid, "dir": d, "name": default_name(aid), "forbidden": False, "note": ""})
+    if len(out) > 1 and out[0]["id"] == "claude":
+        out[0]["name"] = "Claude 1"
+    return out
+
+
+def default_name(aid):
+    return "Claude" if aid == "claude" else "Claude " + aid.split("-", 1)[-1]
+
+
+def account_for_dir(accounts, cfg_dir):
+    d = expand(cfg_dir) if cfg_dir else DEFAULT_CLAUDE_DIR
+    for a in accounts:
+        if a["dir"] == d:
+            return a
+    return {"id": d.name.lstrip("."), "dir": d, "name": default_name(d.name.lstrip(".")), "forbidden": False, "note": ""}
+
+
+def record_file(acct):
+    # Omarchy's own collector writes claude.json for ~/.claude; `agent-fleet limits` writes the rest.
+    return "claude.json" if acct["dir"] == DEFAULT_CLAUDE_DIR else acct["id"] + ".json"
+
+
+def projects_roots(accounts):
+    """Each account's projects dir, de-duplicated by real path (accounts may share one store)."""
+    seen, roots = set(), []
+    for a in accounts:
+        p = a["dir"] / "projects"
+        if p.is_dir():
+            real = p.resolve()
+            if real not in seen:
+                seen.add(real)
+                roots.append(p)
+    return roots
+
+
+def policy(cfg):
+    out = {}
+    f = cfg.get("policyFile")
+    if f and expand(f).exists():
+        for line in expand(f).read_text().splitlines():
+            parts = line.split("#", 1)[0].split()
+            if len(parts) >= 2:
+                out[parts[0]] = parts[1]
+    return out
+
+
+# ------------------------------------------------------------------ processes
+
+
+def processes(accounts):
+    """Agent processes: pane (from env), resumed session id (from argv), account, start time.
+    Claude Code runs its bundled ugrep under its own name, so argv[0] must be claude, not just comm."""
+    procs = []
+    for d in pathlib.Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            comm = (d / "comm").read_text().strip()
+            if comm not in ("claude", "codex"):
+                continue
+            argv = [x.decode(errors="ignore") for x in (d / "cmdline").read_bytes().split(b"\0") if x]
+            if not argv or not argv[0].rsplit("/", 1)[-1].startswith(comm) or "--chrome-native-host" in argv:
+                continue
+            if comm == "codex" and len(argv) > 1 and argv[1] in ("sandbox", "app-server"):
+                continue
+            env = dict(kv.split("=", 1) for kv in (d / "environ").read_bytes().decode(errors="ignore").split("\0") if "=" in kv)
+            start = int((d / "stat").read_text().rsplit(")", 1)[1].split()[19])
+        except (OSError, ValueError, IndexError):
+            continue
+        sid = ""
+        for i, x in enumerate(argv):
+            if x in ("--resume", "-r", "resume") and i + 1 < len(argv):
+                sid = argv[i + 1]
+        if comm == "claude":
+            acct = account_for_dir(accounts, env.get("CLAUDE_CONFIG_DIR", ""))
+            default_model = load_json(acct["dir"] / "settings.json", {}).get("model", "")
+            proc = {"account": acct["id"], "defaultModel": default_model}
+        else:
+            proc = {"account": "codex", "defaultModel": "", "codexHome": env.get("CODEX_HOME", "")}
+        proc.update({"kind": comm, "pid": int(d.name), "start": start, "sid": sid, "pane": env.get("HERDR_PANE_ID", "")})
+        procs.append(proc)
+    return procs
+
+
+def match_process(procs, kind, sid, pane):
+    """By resumed session id first (a pane moved between workspaces keeps a stale HERDR_PANE_ID),
+    then by pane; the most recently started process wins."""
+    cands = [p for p in procs if p["kind"] == kind and sid and p["sid"] == sid]
+    if not cands:
+        cands = [p for p in procs if p["kind"] == kind and p["pane"] == pane]
+    return max(cands, key=lambda p: p["start"]) if cands else {}
+
+
+def herdr_agents():
+    try:
+        out = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True, timeout=20)
+        return json.loads(out.stdout).get("result", {}).get("agents", [])
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+
+
+# ------------------------------------------------------------------ transcript parsing
+
+
+def empty_file_state(inode):
+    return {"inode": inode, "offset": 0, "days": {}, "last": {}, "setModel": {}, "lastId": None,
+            "lastContrib": None, "outs": []}
+
+
+def add_contrib(st, contrib, sign):
+    date, model, vec = contrib
+    cur = st["days"].setdefault(date, {}).setdefault(model, [0] * 7)
+    for i, v in enumerate(vec):
+        cur[i] += sign * v
+
+
+def parse_claude(path, st):
+    """Append-only incremental parse. Vector: in, out, cacheRead, cacheWrite, requests, contextSum, 0.
+    Claude Code writes one line per content block with the same message id; the last one counts."""
+    try:
+        s = path.stat()
+    except OSError:
+        return st
+    if st is None or st.get("inode") != s.st_ino or s.st_size < st.get("offset", 0):
+        st = empty_file_state(s.st_ino)
+    if s.st_size == st["offset"]:
+        return st
+    with path.open("rb") as fh:
+        fh.seek(st["offset"])
+        data = fh.read()
+    end = data.rfind(b"\n")
+    if end < 0:
+        return st
+    st["offset"] += end + 1
+    for raw in data[: end + 1].splitlines():
+        if b"Set model to" in raw and b'"assistant"' not in raw[:200]:
+            txt = ANSI.sub("", raw.decode(errors="ignore"))
+            m = re.search(r"Set model to [`*]*([^`*<\\]+?)[`*]*(?: and saved|<|\\n|$)", txt)
+            if m:
+                ts = re.search(r'"timestamp":"([^"]+)"', txt)
+                st["setModel"] = {"label": m.group(1).strip(), "ts": ts.group(1) if ts else ""}
+            continue
+        if b'"usage"' not in raw or b'"assistant"' not in raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if rec.get("type") != "assistant":
+            continue
+        msg = rec.get("message") or {}
+        u = msg.get("usage") or {}
+        model = msg.get("model") or ""
+        if model == "<synthetic>" or not u:
+            continue
+        date = local_date(rec.get("timestamp"))
+        if not date:
+            continue
+        cin, cout = int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0)
+        cr, cw = int(u.get("cache_read_input_tokens") or 0), int(u.get("cache_creation_input_tokens") or 0)
+        ctx = cin + cr + cw
+        mid = msg.get("id") or rec.get("uuid")
+        new = [date, model, [cin, cout, cr, cw, 1, ctx, 0]]
+        if mid and mid == st["lastId"] and st["lastContrib"]:
+            add_contrib(st, st["lastContrib"], -1)
+            if st["outs"]:
+                st["outs"][-1] = cout
+        else:
+            st["outs"] = (st["outs"] + [cout])[-400:]
+        add_contrib(st, new, +1)
+        st["lastId"], st["lastContrib"] = mid, new
+        st["last"] = {"model": model, "effort": rec.get("effort") or "", "context": ctx, "ts": rec.get("timestamp", "")}
+    return st
+
+
+def parse_codex(path, st):
+    try:
+        s = path.stat()
+    except OSError:
+        return st
+    if st is None or st.get("inode") != s.st_ino or s.st_size < st.get("offset", 0):
+        st = empty_file_state(s.st_ino)
+    if s.st_size == st["offset"]:
+        return st
+    with path.open("rb") as fh:
+        fh.seek(st["offset"])
+        done = False
+        while not done:
+            chunk = fh.readlines(64 * 1024 * 1024)
+            if not chunk:
+                break
+            for raw in chunk:
+                if not raw.endswith(b"\n"):
+                    done = True
+                    break
+                st["offset"] += len(raw)
+                head = raw[:160]
+                if b'"token_usage_record"' in head:
+                    try:
+                        rec = json.loads(raw)
+                    except ValueError:
+                        continue
+                    u = (rec.get("payload") or {}).get("usage") or {}
+                    date = local_date(rec.get("timestamp"))
+                    if not date:
+                        continue
+                    total_in, cached = int(u.get("input_tokens") or 0), int(u.get("cached_input_tokens") or 0)
+                    out = int(u.get("output_tokens") or 0)
+                    model = st["last"].get("model") or "codex"
+                    add_contrib(st, [date, model, [total_in - cached, out, cached, 0, 1, total_in, 0]], +1)
+                    st["outs"] = (st["outs"] + [out])[-400:]
+                    st["last"]["ts"] = rec.get("timestamp", "")
+                elif b'"turn_context"' in head:
+                    try:
+                        p = json.loads(raw).get("payload") or {}
+                    except ValueError:
+                        continue
+                    st["last"]["model"] = p.get("model") or st["last"].get("model", "")
+                    st["last"]["effort"] = p.get("effort") or st["last"].get("effort", "")
+                elif b'"token_count"' in head:
+                    try:
+                        info = (json.loads(raw).get("payload") or {}).get("info") or {}
+                    except ValueError:
+                        continue
+                    last = info.get("last_token_usage") or {}
+                    if last:
+                        st["last"]["context"] = int(last.get("input_tokens") or 0)
+                    if info.get("model_context_window"):
+                        st["last"]["window"] = int(info["model_context_window"])
+    return st
+
+
+# ------------------------------------------------------------------ aggregation
+
+
+def summarise(states, table, today, week_start):
+    agg = {"today": [0] * 7, "week": [0] * 7, "costToday": 0.0, "costWeek": 0.0, "costKnown": True,
+           "costParts": [0.0] * 4}
+    for st in states:
+        for date, models in st.get("days", {}).items():
+            if date < week_start:
+                continue
+            for model, vec in models.items():
+                p = price_for(model, table)
+                c = (vec[0] * p[0] + vec[1] * p[1] + vec[2] * p[2] + vec[3] * p[3]) / 1e6 if p else 0.0
+                if not p:
+                    agg["costKnown"] = False
+                for i in range(7):
+                    agg["week"][i] += vec[i]
+                    if date == today:
+                        agg["today"][i] += vec[i]
+                agg["costWeek"] += c
+                if date == today:
+                    agg["costToday"] += c
+                if p:
+                    for i in range(4):
+                        agg["costParts"][i] += vec[i] * p[i] / 1e6
+    return agg
+
+
+def context_limit(label, default_model, max_ctx, kind, window):
+    if kind == "codex":
+        return window or 258400
+    if (label or "").lower().startswith("haiku"):
+        return 200_000
+    if "1M" in (label or "") or max_ctx > 200_000:
+        return 1_000_000
+    if not label and "[1m]" in (default_model or ""):
+        return 1_000_000
+    return 200_000
+
+
+def family(model_text):
+    t = (model_text or "").lower().replace("claude-", "")
+    for f in ("opus", "sonnet", "haiku", "fable"):
+        if t.startswith(f):
+            return f
+    return ""
+
+
+# ------------------------------------------------------------------ suggestions
+
+
+def suggestions_for(a, table, accounts_by_id):
+    out = []
+    acct = accounts_by_id.get(a["account"], {})
+    if acct.get("forbidden") and a["status"] != "gone":
+        note = (": " + acct["note"]) if acct.get("note") else ""
+        out.append({"severity": 3, "saving": 0, "text": "Running on %s, which is marked not to be used%s." % (acct["name"], note)})
+    pol = a.get("policy")
+    if pol and a["kind"] == "claude" and a["modelNow"] and family(pol) and family(pol) != family(a["modelNow"]):
+        out.append({"severity": 2, "saving": 0, "text": "Policy says %s but it is running %s." % (pol, a["modelNow"])})
+    w, cost = a["week"], a["costWeek"]
+    if a["kind"] != "claude" or cost <= 0 or w[4] < 5:
+        return out
+    parts = a["costParts"]
+    total = sum(parts) or 1
+    fam = family(a["modelNow"])
+    ctx = a["context"]
+    cr_price = (price_for(a["model"], table) or [0, 0, 0, 0])[2]
+    if ctx > 150_000 and fam in ("opus", "fable", "sonnet"):
+        out.append({"severity": 1, "saving": round(parts[2] * 0.6, 2),
+                    "text": "Context is %s: every turn re-reads it (~$%.2f/turn). /compact or a fresh session would cut that sharply."
+                            % (fmt_tokens(ctx), ctx * cr_price / 1e6)})
+    if parts[3] / total > 0.35 and w[4] >= 20:
+        out.append({"severity": 1, "saving": round(parts[3] * 0.5, 2),
+                    "text": "%d%% of its cost is cache rewrites: it is woken after the prompt cache expired, carrying a big context. "
+                            "Batching its wakeups or keeping its context small would cut this." % round(100 * parts[3] / total)})
+    if fam in ("opus", "fable") and w[4] >= 30 and a["medianOutput"] < 400:
+        out.append({"severity": 1, "saving": round(cost * 0.4, 2),
+                    "text": "Mostly short replies (median %d output tokens over %d requests). If its work is routine, a Sonnet model would cost ~40%% less."
+                            % (a["medianOutput"], w[4])})
+    if a["effort"] in ("high", "xhigh", "max") and parts[1] / total > 0.3:
+        out.append({"severity": 1, "saving": round(parts[1] * 0.3, 2),
+                    "text": "Effort '%s' and output/thinking is %d%% of its cost. 'medium' may do for routine work."
+                            % (a["effort"], round(100 * parts[1] / total))})
+    if a["isLoop"] and fam in ("opus", "fable"):
+        out.append({"severity": 1, "saving": round(cost * 0.4, 2),
+                    "text": "Runs on a timer loop at %s. Loop ticks are usually routine: consider a Sonnet model." % a["modelNow"]})
+    return out
+
+
+# ------------------------------------------------------------------ accounts and limits
+
+
+def account_records(accounts, history):
+    now = time.time()
+    entries = [dict(a, record=record_file(a)) for a in accounts]
+    if (HOME / ".codex").exists() or (OMARCHY_USAGE / "codex.json").exists():
+        entries.append({"id": "codex", "name": "Codex", "record": "codex.json", "forbidden": False, "note": ""})
+    out = []
+    for a in entries:
+        rec = load_json(OMARCHY_USAGE / a["record"], None)
+        limits = [{"title": l.get("title") or l.get("label") or "", "label": l.get("label") or "",
+                   "percent": l.get("percent"), "resetsAt": l.get("resetsAt") or ""} for l in (rec or {}).get("limits", [])]
+        weekly = next((l for l in limits if "week" in (l["title"] + l["label"]).lower() and "fable" not in l["title"].lower()), None)
+        proj = None
+        if weekly and weekly["percent"] is not None:
+            pts = [p for p in history.get(a["id"], []) if now - p[0] <= 8 * 86400] + [[now, weekly["percent"]]]
+            # Only samples since the last reset count: a drop in % means the window rolled over.
+            for i in range(len(pts) - 1, 0, -1):
+                if pts[i][1] + 0.02 < pts[i - 1][1]:
+                    pts = pts[i:]
+                    break
+            history[a["id"]] = pts
+            base = next((p for p in pts if now - p[0] <= 6 * 3600), None)
+            reset = iso_to_epoch(weekly["resetsAt"]) if weekly["resetsAt"] else 0
+            if base and now - base[0] >= 3600 and reset > now:
+                rate = (weekly["percent"] - base[1]) / (now - base[0])
+                proj = {"atReset": round(weekly["percent"] + rate * (reset - now), 3), "perDay": round(rate * 86400, 4)}
+        out.append({"id": a["id"], "name": a["name"], "plan": (rec or {}).get("tierLabel") or "", "limits": limits,
+                    "projection": proj, "forbidden": a.get("forbidden", False), "note": a.get("note", ""),
+                    "updatedAt": (rec or {}).get("updatedAt", "")})
+    return out
+
+
+def refresh_limits(cfg):
+    """Omarchy's usage panel only reads ~/.claude. Run its Claude collector once per extra account,
+    each with its own cache dir (the collector's limits cache is not keyed by account), and write the
+    result as a record of its own. Omarchy's Agents panel then shows those accounts as tabs too."""
+    if not OMARCHY_CLAUDE_COLLECTOR.exists():
+        print("agent-fleet: Omarchy's Claude usage collector not found; skipping limits", file=sys.stderr)
+        return 0
+    status = 0
+    for a in claude_accounts(cfg):
+        if a["dir"] == DEFAULT_CLAUDE_DIR or a["forbidden"]:
+            continue
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(a["dir"]), XDG_CACHE_HOME=str(CACHE_DIR / ("limits-" + a["id"])))
+        try:
+            out = subprocess.run([str(OMARCHY_CLAUDE_COLLECTOR), "--limits-only"], capture_output=True, text=True, env=env, timeout=90)
+            rec = json.loads(out.stdout)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            print("agent-fleet: limits collection failed for %s" % a["id"], file=sys.stderr)
+            status = 1
+            continue
+        keep = {k: rec[k] for k in ("schemaVersion", "updatedAt", "tierLabel", "usageStatusText", "authHelpText", "limits", "retryAdvised") if k in rec}
+        keep.update({"id": a["id"], "name": a["name"], "ready": bool(rec.get("limits")), "hasLocalStats": False})
+        write_json_atomic(OMARCHY_USAGE / record_file(a), keep)
+    return status
+
+
+# ------------------------------------------------------------------ collect
+
+
+def collect():
+    cfg = config()
+    table = prices(cfg)
+    accounts = claude_accounts(cfg)
+    by_id = {a["id"]: a for a in accounts}
+    roots = projects_roots(accounts)
+    cache = load_json(CACHE_DIR / "parse-state.json", {})
+    if cache.get("version") != PARSER_VERSION:
+        cache = {"version": PARSER_VERSION, "files": {}}
+    files = cache["files"]
+    now = dt.datetime.now().astimezone()
+    today = now.strftime("%Y-%m-%d")
+    week_start = (now - dt.timedelta(days=6)).strftime("%Y-%m-%d")
+    procs = processes(accounts)
+    pol = policy(cfg)
+    loops = set(cfg.get("loopAgents") or [])
+    agents, attributed, touched = [], set(), set()
+
+    for h in herdr_agents():
+        name = h.get("name") or h.get("pane_id")
+        kind, pane = h.get("agent"), h.get("pane_id")
+        sid = (h.get("agent_session") or {}).get("value") or ""
+        proc = match_process(procs, kind, sid, pane)
+        paths = []
+        if kind == "claude" and sid:
+            main = next((f for r in roots for f in r.glob("*/" + sid + ".jsonl")), None)
+            if main:
+                paths = [main] + sorted((main.parent / sid).glob("subagents/*.jsonl"))
+        elif kind == "codex" and sid:
+            codex_home = expand(proc.get("codexHome") or cfg.get("codexHome") or "~/.codex")
+            paths = sorted((codex_home / "sessions").glob("*/*/*/*" + sid + ".jsonl"))[-1:]
+        states = []
+        for p in paths:
+            key = str(p)
+            files[key] = (parse_claude if kind == "claude" else parse_codex)(p, files.get(key))
+            states.append(files[key])
+            attributed.add(key)
+            touched.add(key)
+        main_st = states[0] if states else {}
+        last, set_model = main_st.get("last", {}), main_st.get("setModel", {})
+        agg = summarise(states, table, today, week_start)
+        model = last.get("model", "")
+        pending = set_model["label"] if set_model.get("label") and set_model.get("ts", "") > last.get("ts", "") else ""
+        model_now = pending or model_label(model)
+        max_ctx = max((m[5] / m[4] for d in main_st.get("days", {}).values() for m in d.values() if m[4]), default=0)
+        outs = [o for st in states for o in st.get("outs", [])]
+        a = {
+            "name": name, "pane": pane, "workspace": h.get("workspace_id", ""), "kind": kind,
+            "status": (h.get("agent_status") or "") if proc else "gone",
+            "account": proc.get("account") or ("codex" if kind == "codex" else "unknown"),
+            "model": model, "modelNow": model_now, "modelPending": bool(pending),
+            "effort": last.get("effort", ""), "context": last.get("context", 0),
+            "contextLimit": context_limit(pending or set_model.get("label", "") or model_label(model),
+                                          proc.get("defaultModel", ""), max(last.get("context", 0), max_ctx), kind, last.get("window")),
+            "lastActive": last.get("ts", ""), "hasTranscript": bool(states),
+            "today": agg["today"], "week": agg["week"], "costToday": round(agg["costToday"], 4),
+            "costWeek": round(agg["costWeek"], 4), "costKnown": agg["costKnown"] and kind == "claude",
+            "costParts": [round(x, 4) for x in agg["costParts"]], "medianOutput": median(outs),
+            "policy": pol.get(name, ""), "isLoop": name in loops,
+        }
+        a["suggestions"] = suggestions_for(a, table, by_id)
+        agents.append(a)
+
+    # Claude work that isn't a herdr agent: interactive sessions, one-offs, older sessions of restarted agents.
+    other_states = []
+    cutoff = time.time() - 7 * 86400
+    for r in roots:
+        for p in r.glob("*/*.jsonl"):
+            key = str(p)
+            if key in attributed:
+                continue
+            try:
+                if p.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+            for f in [p] + sorted((p.parent / p.stem).glob("subagents/*.jsonl")):
+                k = str(f)
+                if k not in attributed:
+                    files[k] = parse_claude(f, files.get(k))
+                    touched.add(k)
+                    other_states.append(files[k])
+    other = summarise(other_states, table, today, week_start)
+
+    for key in list(files):
+        if key not in touched:
+            del files[key]
+    write_json_atomic(CACHE_DIR / "parse-state.json", cache)
+
+    history = load_json(STATE_DIR / "history.json", {})
+    accts = account_records(accounts, history)
+    write_json_atomic(STATE_DIR / "history.json", history)
+
+    total_week = sum(a["costWeek"] for a in agents if a["costKnown"]) + other["costWeek"]
+    codex_week = sum(sum(a["week"][:4]) for a in agents if a["kind"] == "codex")
+    for a in agents:
+        if a["kind"] == "codex":
+            a["share"] = round(sum(a["week"][:4]) / codex_week, 4) if codex_week else 0
+        else:
+            a["share"] = round(a["costWeek"] / total_week, 4) if total_week and a["costKnown"] else 0
+    agents.sort(key=lambda a: (-(a["costWeek"] if a["costKnown"] else 0), -a["week"][4], a["name"]))
+    suggestions = [dict(s, agent=a["name"]) for a in agents for s in a["suggestions"]]
+    suggestions.sort(key=lambda s: (-s["severity"] if s["severity"] >= 2 else 0, -s["saving"]))
+    snapshot = {
+        "schemaVersion": 1, "updatedAt": now.isoformat(), "today": today, "weekStart": week_start,
+        "accounts": accts, "agents": agents,
+        "other": {"costWeek": round(other["costWeek"], 4), "costToday": round(other["costToday"], 4)},
+        "totals": {"costWeek": round(total_week, 2),
+                   "costToday": round(sum(a["costToday"] for a in agents if a["costKnown"]) + other["costToday"], 2)},
+        "suggestions": suggestions, "pricesAssumed": cfg.get("pricesAssumed", DEFAULT_ASSUMED),
+    }
+    write_json_atomic(STATE_DIR / "snapshot.json", snapshot)
+    return snapshot
+
+
+# ------------------------------------------------------------------ demo data
+
+
+def demo():
+    """Made-up fleet, so the widget can be tried (and screenshotted) without real agents."""
+    now = dt.datetime.now().astimezone()
+    iso = lambda **kw: (now + dt.timedelta(**kw)).isoformat()
+    rows = [
+        ("app", "claude-1", "working", "Opus 5.5 1M", "medium", 612_000, 1_000_000, 181.4, 21),
+        ("api", "claude-1", "idle", "Opus 5.5", "medium", 118_000, 200_000, 142.9, 17),
+        ("product-owner", "claude-2", "idle", "Opus 5.5 1M", "medium", 402_000, 1_000_000, 96.3, 11),
+        ("web", "claude-1", "working", "Opus 5.5 1M", "medium", 257_000, 1_000_000, 71.8, 8),
+        ("ops", "claude-2", "idle", "Sonnet 5", "high", 143_000, 200_000, 54.2, 6),
+        ("support", "claude-2", "done", "Sonnet 5", "high", 88_000, 200_000, 38.6, 5),
+        ("marketing", "claude-2", "idle", "Opus 5.5 1M", "medium", 845_000, 1_000_000, 33.1, 4),
+        ("researcher", "claude-2", "idle", "Opus 5.5 1M", "high", 214_000, 1_000_000, 22.4, 3),
+        ("tester", "claude-1", "idle", "Sonnet 5", "high", 61_000, 200_000, 12.7, 2),
+        ("writer", "claude-2", "idle", "Opus 5.5 1M", "medium", 39_000, 1_000_000, 4.9, 1),
+    ]
+    agents = []
+    for name, acct, status, model, effort, ctx, limit, cost, share in rows:
+        sugg = []
+        if ctx > 600_000:
+            sugg.append({"severity": 1, "saving": round(cost * 0.5, 2),
+                         "text": "Context is %s: every turn re-reads it (~$%.2f/turn). /compact or a fresh session would cut that sharply." % (fmt_tokens(ctx), ctx * 0.5 / 1e6)})
+        agents.append({"name": name, "pane": "w1:p%d" % (len(agents) + 1), "kind": "claude", "status": status, "account": acct,
+                       "model": "", "modelNow": model.replace(" 1M", " (1M context)"), "modelPending": False, "effort": effort,
+                       "context": ctx, "contextLimit": limit, "lastActive": iso(minutes=-7 * (len(agents) + 1)),
+                       "today": [0, 0, 0, 0, 40, 0, 0], "week": [0, 0, int(cost * 1.6e6), 0, 300 - 25 * len(agents), 0, 0],
+                       "costToday": round(cost / 5, 2), "costWeek": cost, "costKnown": True, "costParts": [0, cost * 0.05, cost * 0.7, cost * 0.25],
+                       "medianOutput": 520, "policy": "", "isLoop": False, "share": share / 100, "suggestions": sugg})
+    for name, model, effort, ctx, tokens, share, status in (("codex-api", "gpt-6-astra", "medium", 162_000, 820e6, 0.64, "working"),
+                                                             ("codex-data", "gpt-5.6-sol", "high", 94_000, 460e6, 0.36, "idle")):
+        agents.append({"name": name, "pane": "w2:p%d" % len(agents), "kind": "codex", "status": status, "account": "codex",
+                       "model": model, "modelNow": model, "modelPending": False, "effort": effort, "context": ctx, "contextLimit": 258400,
+                       "lastActive": iso(minutes=-3), "today": [0, 0, int(tokens / 9), 0, 30, 0, 0], "week": [0, 0, int(tokens), 0, 400, 0, 0],
+                       "costToday": 0, "costWeek": 0, "costKnown": False, "costParts": [0, 0, 0, 0], "medianOutput": 300,
+                       "policy": "", "isLoop": False, "share": share, "suggestions": []})
+    lim = lambda s, w, days: [{"title": "Session (5-hour)", "label": "Session (5-hour)", "percent": s, "resetsAt": iso(hours=2)},
+                              {"title": "Weekly (7-day)", "label": "Weekly (7-day)", "percent": w, "resetsAt": iso(days=days)}]
+    accounts = [
+        {"id": "claude-1", "name": "Claude 1", "plan": "Max 20x", "limits": lim(0.12, 0.31, 4.4), "projection": {"atReset": 0.58, "perDay": 0.06}, "forbidden": False, "note": ""},
+        {"id": "claude-2", "name": "Claude 2", "plan": "Max 20x", "limits": lim(0.04, 0.47, 2.1), "projection": {"atReset": 0.66, "perDay": 0.09}, "forbidden": False, "note": ""},
+        {"id": "codex", "name": "Codex", "plan": "pro", "limits": lim(0.0, 0.62, 3.2)[1:], "projection": {"atReset": 0.93, "perDay": 0.1}, "forbidden": False, "note": ""},
+    ]
+    suggestions = [dict(s, agent=a["name"]) for a in agents for s in a["suggestions"]]
+    suggestions.append({"agent": "support", "severity": 1, "saving": 9.4,
+                        "text": "41% of its cost is cache rewrites: it is woken after the prompt cache expired, carrying a big context. Batching its wakeups or keeping its context small would cut this."})
+    total = sum(a["costWeek"] for a in agents)
+    snap = {"schemaVersion": 1, "updatedAt": now.isoformat(), "today": now.strftime("%Y-%m-%d"), "weekStart": "",
+            "accounts": accounts, "agents": agents, "other": {"costWeek": 18.2, "costToday": 2.1},
+            "totals": {"costWeek": round(total + 18.2, 2), "costToday": round(total / 5, 2)}, "suggestions": suggestions,
+            "pricesAssumed": DEFAULT_ASSUMED, "demo": True}
+    write_json_atomic(STATE_DIR / "snapshot.json", snap)
+    return snap
+
+
+# ------------------------------------------------------------------ table
+
+
+def print_table(s):
+    print("Accounts")
+    for acc in s["accounts"]:
+        lims = "  ".join("%s %d%%" % ((l["title"] or l["label"])[:14], round(100 * l["percent"])) for l in acc["limits"] if l["percent"] is not None)
+        pr = acc.get("projection")
+        print("  %-12s %-9s %s%s" % (acc["name"], acc["plan"], lims, ("  -> on pace for %d%% at reset" % round(100 * pr["atReset"])) if pr else ""))
+    print("\n%-24s %-10s %-9s %-15s %-7s %-12s %9s %9s %6s" % ("AGENT", "ACCOUNT", "STATE", "MODEL", "EFFORT", "CONTEXT", "WEEK $", "TODAY $", "SHARE"))
+    for a in s["agents"]:
+        cost_w = "$%.2f" % a["costWeek"] if a["costKnown"] else fmt_tokens(sum(a["week"][:4])) + "t"
+        cost_t = "$%.2f" % a["costToday"] if a["costKnown"] else fmt_tokens(sum(a["today"][:4])) + "t"
+        print("%-24s %-10s %-9s %-15s %-7s %-12s %9s %9s %5d%%" % (
+            a["name"][:24], a["account"][:10], a["status"][:9], (a["modelNow"] + ("*" if a["modelPending"] else ""))[:15],
+            a["effort"][:7], "%s/%s" % (fmt_tokens(a["context"]), fmt_tokens(a["contextLimit"])), cost_w, cost_t, round(100 * a["share"])))
+    print("%-24s %64s %9s" % ("(not a herdr agent)", "$%.2f" % s["other"]["costWeek"], "$%.2f" % s["other"]["costToday"]))
+    print("\nClaude $ = API list-price estimate for comparing agents; * = model switched, not yet used. Total this week: $%.2f" % s["totals"]["costWeek"])
+    if s["suggestions"]:
+        print("\nSuggestions")
+        for x in s["suggestions"]:
+            print("  - %s: %s%s" % (x["agent"], x["text"], (" (~$%.0f/wk)" % x["saving"]) if x["saving"] >= 1 else ""))
+
+
+def main(args):
+    if args[:1] in (["-h"], ["--help"], ["help"]):
+        print(__doc__.strip())
+        return 0
+    if args[:1] == ["limits"]:
+        return refresh_limits(config())
+    if args[:1] == ["demo"]:
+        if "--off" in args:
+            DEMO_FLAG.unlink(missing_ok=True)
+            collect()
+            print("Demo mode off: showing your real fleet again.")
+            return 0
+        snap = demo()
+        if "--print" in args:
+            print_table(snap)
+            return 0
+        DEMO_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        DEMO_FLAG.touch()
+        print("Demo mode on: the widget shows made-up sample data until you run `agent-fleet demo --off`.")
+        return 0
+    if DEMO_FLAG.exists():
+        if args[:1] == ["collect"]:
+            return 0
+        print("Demo mode is on (the widget shows sample data). Run `agent-fleet demo --off` to go back to your real fleet.", file=sys.stderr)
+    snap = collect() if not DEMO_FLAG.exists() else load_json(STATE_DIR / "snapshot.json", {})
+    if args[:1] == ["collect"]:
+        return 0
+    if "--json" in args:
+        print(json.dumps(snap, indent=1))
+    else:
+        print_table(snap)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

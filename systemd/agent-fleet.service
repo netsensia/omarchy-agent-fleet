@@ -1,0 +1,7 @@
+[Unit]
+Description=Agent Fleet: collect per-agent usage for the Omarchy bar widget
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agent-fleet collect
+Nice=10

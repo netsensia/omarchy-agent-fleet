@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "netsensia.agent-fleet",
+  "name": "Agent Fleet",
+  "version": "1.0.0",
+  "author": "Netsensia",
+  "license": "MIT",
+  "description": "Every herdr agent at a glance: which Claude or Codex account it runs on, its model, effort, context window and estimated usage, with suggestions for where to save.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Agent Fleet",
+    "description": "Per-agent account, model, effort, context and usage for a herdr agent fleet, plus efficiency suggestions.",
+    "category": "AI",
+    "aliases": ["fleet", "agent-fleet", "herdr"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {}
+  }
+}
