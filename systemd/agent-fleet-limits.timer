@@ -2,9 +2,11 @@
 Description=Agent Fleet: refresh extra Claude accounts' limits every 5 minutes
 
 [Timer]
-OnBootSec=1min
-OnUnitActiveSec=5min
+# Clock-based, not relative to the last run: a monotonic OnUnitActiveSec timer never re-arms if its
+# first run is missed (seen after a reboot), which froze the extra accounts' limits for days.
+OnCalendar=*:0/5
 Persistent=true
+AccuracySec=30s
 
 [Install]
 WantedBy=timers.target
