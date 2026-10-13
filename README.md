@@ -29,6 +29,11 @@ times more per turn than one at 100K, whatever the model. Output and "thinking" 
 **Accounts:** each Claude account (one per `CLAUDE_CONFIG_DIR`) and Codex, with the plan, weekly and
 session usage, time to reset, the pace it's on for the reset, and how many agents it's carrying.
 
+**Sign-in warnings:** Claude sign-ins expire after about a month, and when one does, every agent on that
+account stops with "Please run /login". From three days before expiry (or as soon as an account is signed out),
+the bar icon turns red, the account shows "sign-in expires in …", the warning goes to the top of the panel, and
+you get one desktop notification a day until you run `claude auth login` for that account.
+
 **Agents:** one row per herdr agent, heaviest first:
 
 - status dot (working, idle, or gone)
@@ -115,12 +120,14 @@ Optional. Copy `config.example.json` to `~/.config/agent-fleet/config.json` and 
 | `pricesAssumed` | Models whose prices are guesses, so the snapshot can say so. |
 | `policyFile` | A text file of `<agent> <model>` lines. Agents running a different model family get flagged. |
 | `loopAgents` | Names of agents that run on timers, so premium models on them get flagged. |
+| `loginWarnDays` | How many days before a Claude sign-in expires to start warning (default 3). |
 
 ## How the numbers work
 
 - **Everything is read locally.** Agents come from `herdr agent list`; their account, pane and session come
   from `/proc`; usage comes from Claude Code's and Codex's own session files. The only network calls are
-  Omarchy's collector reading your plan limits with the login you already have.
+  Omarchy's collector reading your plan limits with the login you already have. For sign-in warnings it reads
+  only the expiry date stored next to each account's login, never the token, and skips accounts marked forbidden.
 - **Claude cost is an estimate at API list prices.** It's there to compare agents, not to predict a bill:
   on a flat subscription, an agent's share of estimated cost is a good stand-in for its share of the
   allowance. Codex is shown in tokens.

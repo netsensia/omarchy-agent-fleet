@@ -499,10 +499,23 @@ def account_records(accounts, history):
             if base and now - base[0] >= 3600 and reset > now:
                 rate = (weekly["percent"] - base[1]) / (now - base[0])
                 proj = {"atReset": round(weekly["percent"] + rate * (reset - now), 3), "perDay": round(rate * 86400, 4)}
+        login = login_state(a) if a.get("dir") and not a.get("forbidden") else {}
         out.append({"id": a["id"], "name": a["name"], "plan": (rec or {}).get("tierLabel") or "", "limits": limits,
                     "projection": proj, "forbidden": a.get("forbidden", False), "note": a.get("note", ""),
-                    "updatedAt": (rec or {}).get("updatedAt", "")})
+                    "updatedAt": (rec or {}).get("updatedAt", ""), **login})
     return out
+
+
+def login_state(acct):
+    """When this account's sign-in expires. Claude sign-ins end when the refresh token does (about a
+    month), after which Claude Code clears the token and every agent on the account needs /login.
+    Reads only the expiry timestamp and whether a token is present, never the token itself."""
+    o = load_json(acct["dir"] / ".credentials.json", {}).get("claudeAiOauth") or {}
+    if not o:
+        return {}
+    exp = o.get("refreshTokenExpiresAt")
+    return {"signedIn": bool(o.get("accessToken")),
+            "loginExpiresAt": dt.datetime.fromtimestamp(exp / 1000).astimezone().isoformat() if exp else ""}
 
 
 def refresh_limits(cfg):
@@ -528,6 +541,41 @@ def refresh_limits(cfg):
         keep.update({"id": a["id"], "name": a["name"], "ready": bool(rec.get("limits")), "hasLocalStats": False})
         write_json_atomic(OMARCHY_USAGE / record_file(a), keep)
     return status
+
+
+def login_warnings(accts, agents, cfg):
+    """Warn before a Claude sign-in expires (default: 3 days), and once a day on the desktop."""
+    warn_days = float(cfg.get("loginWarnDays", 3))
+    now = time.time()
+    out, notes = [], load_json(STATE_DIR / "login-notified.json", {})
+    for a in accts:
+        if a.get("forbidden") or "signedIn" not in a:
+            continue
+        n = sum(1 for g in agents if g["account"] == a["id"] and g["status"] != "gone")
+        exp = iso_to_epoch(a["loginExpiresAt"]) if a.get("loginExpiresAt") else 0
+        left = exp - now if exp else None
+        if not a["signedIn"] or (left is not None and left <= 0):
+            text = "%s is signed out: its %d agent(s) will fail with \"Please run /login\". Run `claude auth login` in a folder that uses it." % (a["name"], n)
+        elif left is not None and left <= warn_days * 86400:
+            text = "%s's sign-in expires in %s (%s): run `claude auth login` in a folder that uses it before then, or its %d agent(s) will stop." % (
+                a["name"], fmt_duration(left), dt.datetime.fromtimestamp(exp).strftime("%a %d %b %H:%M"), n)
+        else:
+            continue
+        out.append({"agent": a["name"], "severity": 3, "saving": 0, "text": text})
+        today = dt.date.today().isoformat()
+        if notes.get(a["id"]) != today and not DEMO_FLAG.exists():
+            try:
+                subprocess.run(["notify-send", "-u", "critical", "-a", "Agent Fleet", "Claude sign-in", text], timeout=10)
+                notes[a["id"]] = today
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    write_json_atomic(STATE_DIR / "login-notified.json", notes)
+    return out
+
+
+def fmt_duration(seconds):
+    h = int(seconds // 3600)
+    return "%dd %dh" % (h // 24, h % 24) if h >= 24 else "%dh %dm" % (h, int(seconds % 3600 // 60))
 
 
 # ------------------------------------------------------------------ collect
@@ -635,6 +683,7 @@ def collect():
             a["share"] = round(a["costWeek"] / total_week, 4) if total_week and a["costKnown"] else 0
     agents.sort(key=lambda a: (-(a["costWeek"] if a["costKnown"] else 0), -a["week"][4], a["name"]))
     suggestions = [dict(s, agent=a["name"]) for a in agents for s in a["suggestions"]]
+    suggestions += login_warnings(accts, agents, cfg)
     suggestions.sort(key=lambda s: (-s["severity"] if s["severity"] >= 2 else 0, -s["saving"]))
     snapshot = {
         "schemaVersion": 1, "updatedAt": now.isoformat(), "today": today, "weekStart": week_start,
@@ -690,10 +739,13 @@ def demo():
                               {"title": "Weekly (7-day)", "label": "Weekly (7-day)", "percent": w, "resetsAt": iso(days=days)}]
     accounts = [
         {"id": "claude-1", "name": "Claude 1", "plan": "Max 20x", "limits": lim(0.12, 0.31, 4.4), "projection": {"atReset": 0.58, "perDay": 0.06}, "forbidden": False, "note": ""},
-        {"id": "claude-2", "name": "Claude 2", "plan": "Max 20x", "limits": lim(0.04, 0.47, 2.1), "projection": {"atReset": 0.66, "perDay": 0.09}, "forbidden": False, "note": ""},
+        {"id": "claude-2", "name": "Claude 2", "plan": "Max 20x", "limits": lim(0.04, 0.47, 2.1), "projection": {"atReset": 0.66, "perDay": 0.09}, "forbidden": False, "note": "",
+         "signedIn": True, "loginExpiresAt": iso(days=2, hours=5)},
         {"id": "codex", "name": "Codex", "plan": "pro", "limits": lim(0.0, 0.62, 3.2)[1:], "projection": {"atReset": 0.93, "perDay": 0.1}, "forbidden": False, "note": ""},
     ]
     suggestions = [dict(s, agent=a["name"]) for a in agents for s in a["suggestions"]]
+    suggestions.insert(0, {"agent": "Claude 2", "severity": 3, "saving": 0,
+                           "text": "Claude 2's sign-in expires in 2d 5h: run `claude auth login` in a folder that uses it before then, or its 6 agent(s) will stop."})
     suggestions.append({"agent": "support", "severity": 1, "saving": 9.4,
                         "text": "41% of its cost is cache rewrites: it is woken after the prompt cache expired, carrying a big context. Batching its wakeups or keeping its context small would cut this."})
     total = sum(a["costWeek"] for a in agents)

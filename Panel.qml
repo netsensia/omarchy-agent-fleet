@@ -47,6 +47,7 @@ Panel {
   }
   readonly property var topSuggestions: snapshot ? (snapshot.suggestions || []).slice(0, 7) : []
   readonly property bool alarming: {
+    for (var k = 0; k < usedAccounts.length; k++) if (loginTrouble(usedAccounts[k])) return true
     for (var i = 0; i < usedAccounts.length; i++) {
       var w = weeklyLimit(usedAccounts[i])
       if (usedAccounts[i].agentCount > 0 && w && w.percent >= 0.9) return true
@@ -149,8 +150,25 @@ Panel {
     return null
   }
 
+  function loginLeftMs(acct) {
+    if (!acct || !acct.loginExpiresAt) return -1
+    var t = new Date(String(acct.loginExpiresAt)).getTime()
+    return isFinite(t) ? t - root.nowMs : -1
+  }
+
+  function loginTrouble(acct) {
+    if (!acct || acct.forbidden || acct.signedIn === undefined) return false
+    var left = loginLeftMs(acct)
+    return acct.signedIn === false || (acct.loginExpiresAt && left <= 3 * 86400000)
+  }
+
   function accountCaption(acct) {
     var parts = []
+    if (acct.signedIn === false) parts.push("SIGNED OUT: run claude auth login")
+    else {
+      var left = loginLeftMs(acct)
+      if (acct.loginExpiresAt && left <= 7 * 86400000) parts.push(left > 0 ? "sign-in expires in " + until(acct.loginExpiresAt) : "SIGN-IN EXPIRED")
+    }
     var s = sessionLimit(acct)
     if (s && s.percent !== null) parts.push("Session " + Math.round(s.percent * 100) + "%")
     var w = weeklyLimit(acct)
@@ -418,7 +436,11 @@ Panel {
             spacing: Style.space(8)
             visible: root.topSuggestions.length > 0
 
-            PanelSectionHeader { text: "WHERE TO SAVE"; foreground: root.foreground; fontFamily: root.fontFamily }
+            PanelSectionHeader {
+              text: root.topSuggestions.length && root.topSuggestions[0].severity >= 3 ? "NEEDS ATTENTION · WHERE TO SAVE" : "WHERE TO SAVE"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
 
             Repeater {
               model: root.topSuggestions
@@ -506,7 +528,7 @@ Panel {
       width: parent.width
       textFormat: Text.PlainText
       text: accountRow.acct ? root.accountCaption(accountRow.acct) : ""
-      color: root.dim
+      color: root.loginTrouble(accountRow.acct) ? root.urgent : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
       elide: Text.ElideRight
